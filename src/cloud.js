@@ -83,6 +83,7 @@ function mapChannelFromDb(row) {
     banner: row.banner || '/images/banner.jpg',
     whatsapp: row.whatsapp || '',
     adminPin: row.admin_pin || '1234',
+    superAdminPin: row.super_admin_pin || '9999',
   };
 }
 
@@ -98,6 +99,7 @@ function mapChannelToDb(channel) {
     banner: channel.banner || '/images/banner.jpg',
     whatsapp: channel.whatsapp || '',
     admin_pin: channel.adminPin || '1234',
+    super_admin_pin: channel.superAdminPin || '9999',
     updated_at: new Date().toISOString(),
   };
 }
@@ -131,6 +133,7 @@ function mapItemFromDb(row, likedSet) {
     allSizes: Boolean(row.all_sizes),
     likes: Number(row.likes) || 0,
     liked: likedSet.has(row.id),
+    uploadedBy: row.uploaded_by || 'Admin',
     createdAt: Number(row.created_at) || Date.now(),
   };
 }
@@ -144,7 +147,66 @@ function mapItemToDb(item) {
     sizes: Array.isArray(item.sizes) ? item.sizes : [],
     all_sizes: Boolean(item.allSizes),
     likes: Number(item.likes) || 0,
+    uploaded_by: item.uploadedBy || 'Admin',
     created_at: Number(item.createdAt) || Date.now(),
+  };
+}
+
+function mapAdminFromDb(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    roleLabel: row.role_label || 'Staff Admin',
+    pin: row.pin,
+    active: row.active !== false,
+    permissions: {
+      canUpload: row.permissions?.canUpload !== false,
+      canEdit: row.permissions?.canEdit !== false,
+      canDelete: Boolean(row.permissions?.canDelete),
+      canManageCollections: row.permissions?.canManageCollections !== false,
+    },
+    createdAt: Number(row.created_at) || Date.now(),
+  };
+}
+
+function mapAdminToDb(admin) {
+  return {
+    id: admin.id,
+    name: admin.name,
+    role_label: admin.roleLabel || 'Staff Admin',
+    pin: admin.pin,
+    active: admin.active !== false,
+    permissions: {
+      canUpload: admin.permissions?.canUpload !== false,
+      canEdit: admin.permissions?.canEdit !== false,
+      canDelete: Boolean(admin.permissions?.canDelete),
+      canManageCollections: admin.permissions?.canManageCollections !== false,
+    },
+    created_at: Number(admin.createdAt) || Date.now(),
+  };
+}
+
+function mapLogFromDb(row) {
+  return {
+    id: row.id,
+    actorName: row.actor_name || 'Admin',
+    actorRole: row.actor_role || 'admin',
+    action: row.action || 'info',
+    details: row.details || '',
+    thumbnail: row.thumbnail || '',
+    createdAt: Number(row.created_at) || Date.now(),
+  };
+}
+
+function mapLogToDb(log) {
+  return {
+    id: log.id,
+    actor_name: log.actorName || 'Admin',
+    actor_role: log.actorRole || 'admin',
+    action: log.action || 'info',
+    details: log.details || '',
+    thumbnail: log.thumbnail || '',
+    created_at: Number(log.createdAt) || Date.now(),
   };
 }
 
@@ -217,14 +279,26 @@ export async function deleteImageFromCloud(imageUrl) {
 }
 
 export async function fetchCloudState() {
-  const [profileRows, colRows, itemRows] = await Promise.all([
-    restFetch('channel_profile?id=eq.main&select=*'),
-    restFetch('collections?select=*&order=sort_order.asc'),
-    restFetch('fashion_items?select=*&order=created_at.desc'),
-  ]);
+  const [profileRows, colRows, itemRows, adminRows, logRows] =
+    await Promise.all([
+      restFetch('channel_profile?id=eq.main&select=*'),
+      restFetch('collections?select=*&order=sort_order.asc'),
+      restFetch('fashion_items?select=*&order=created_at.desc'),
+      restFetch('admin_users?select=*&order=created_at.asc').catch(() => null),
+      restFetch('activity_logs?select=*&order=created_at.desc&limit=300').catch(
+        () => null
+      ),
+    ]);
 
   if (!Array.isArray(profileRows) || profileRows.length === 0) {
-    return { initialized: false, channel: null, collections: [], items: [] };
+    return {
+      initialized: false,
+      channel: null,
+      collections: [],
+      items: [],
+      admins: null,
+      logs: null,
+    };
   }
 
   const likedSet = getVisitorLikedIds();
@@ -233,6 +307,8 @@ export async function fetchCloudState() {
     channel: mapChannelFromDb(profileRows[0]),
     collections: (colRows || []).map(mapCollectionFromDb),
     items: (itemRows || []).map((r) => mapItemFromDb(r, likedSet)),
+    admins: Array.isArray(adminRows) ? adminRows.map(mapAdminFromDb) : null,
+    logs: Array.isArray(logRows) ? logRows.map(mapLogFromDb) : null,
   };
 }
 
@@ -305,6 +381,40 @@ export async function deleteCloudCollection(id, coverUrl) {
   await deleteImageFromCloud(coverUrl);
 }
 
+export async function upsertCloudAdmin(admin) {
+  await restFetch('admin_users?on_conflict=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify(mapAdminToDb(admin)),
+  });
+}
+
+export async function deleteCloudAdmin(id) {
+  await restFetch(`admin_users?id=eq.${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' },
+  });
+}
+
+export async function insertCloudLog(log) {
+  try {
+    await restFetch('activity_logs?on_conflict=id', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(mapLogToDb(log)),
+    });
+  } catch {
+    // Don't break user flow if activity_logs table hasn't been migrated yet
+  }
+}
+
+export async function clearCloudLogs() {
+  await restFetch('activity_logs?id=not.is.null', {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' },
+  });
+}
+
 export async function toggleCloudItemLike(id, delta) {
   return restFetch('rpc/toggle_item_like', {
     method: 'POST',
@@ -319,7 +429,7 @@ export async function toggleCloudChannelFollow(delta) {
   });
 }
 
-export async function seedCloudDefaults({ channel, collections, items }) {
+export async function seedCloudDefaults({ channel, collections, items, admins }) {
   await saveCloudChannel(channel);
   if (collections.length > 0) {
     await restFetch('collections?on_conflict=id', {
@@ -333,9 +443,25 @@ export async function seedCloudDefaults({ channel, collections, items }) {
   if (items.length > 0) {
     await insertCloudItems(items);
   }
+  if (Array.isArray(admins) && admins.length > 0) {
+    try {
+      await restFetch('admin_users?on_conflict=id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify(admins.map(mapAdminToDb)),
+      });
+    } catch {
+      // Soft fail if admin_users table not migrated yet
+    }
+  }
 }
 
-export async function replaceAllCloudData({ channel, collections, items }) {
+export async function replaceAllCloudData({
+  channel,
+  collections,
+  items,
+  admins,
+}) {
   await Promise.all([
     restFetch('fashion_items?id=not.is.null', {
       method: 'DELETE',
@@ -346,5 +472,15 @@ export async function replaceAllCloudData({ channel, collections, items }) {
       headers: { Prefer: 'return=minimal' },
     }),
   ]);
-  await seedCloudDefaults({ channel, collections, items });
+  if (Array.isArray(admins)) {
+    try {
+      await restFetch('admin_users?id=not.is.null', {
+        method: 'DELETE',
+        headers: { Prefer: 'return=minimal' },
+      });
+    } catch {
+      // ignore if table not created yet
+    }
+  }
+  await seedCloudDefaults({ channel, collections, items, admins });
 }

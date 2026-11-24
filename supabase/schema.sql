@@ -1,6 +1,7 @@
 -- ============================================================
 -- Vastra Studio — Fashion Channel (Supabase One-Click Schema)
--- Paste this entire file into Supabase -> SQL Editor -> Run
+-- Safe to run multiple times (idempotent)
+-- Paste into Supabase -> SQL Editor -> Run
 -- ============================================================
 
 -- 1. Channel Profile Table (single row: id = 'main')
@@ -15,8 +16,12 @@ create table if not exists public.channel_profile (
   banner text not null default '/images/banner.jpg',
   whatsapp text not null default '',
   admin_pin text not null default '1234',
+  super_admin_pin text not null default '9999',
   updated_at timestamptz not null default now()
 );
+
+alter table public.channel_profile
+  add column if not exists super_admin_pin text not null default '9999';
 
 -- 2. Collections Table
 create table if not exists public.collections (
@@ -36,16 +41,47 @@ create table if not exists public.fashion_items (
   sizes jsonb not null default '[]'::jsonb,
   all_sizes boolean not null default false,
   likes integer not null default 0,
+  uploaded_by text not null default 'Admin',
   created_at bigint not null
 );
+
+alter table public.fashion_items
+  add column if not exists uploaded_by text not null default 'Admin';
 
 create index if not exists fashion_items_created_at_idx
   on public.fashion_items (created_at desc);
 
--- 4. Enable Row Level Security & Policies
+-- 4. Staff / Admin Accounts Table (Managed by Super Admin)
+create table if not exists public.admin_users (
+  id text primary key,
+  name text not null,
+  role_label text not null default 'Staff Admin',
+  pin text not null,
+  active boolean not null default true,
+  permissions jsonb not null default '{"canUpload":true,"canEdit":true,"canDelete":false,"canManageCollections":true}'::jsonb,
+  created_at bigint not null
+);
+
+-- 5. Activity Audit Logs Table (Who uploaded/edited/deleted what & when)
+create table if not exists public.activity_logs (
+  id text primary key,
+  actor_name text not null,
+  actor_role text not null default 'admin',
+  action text not null,
+  details text not null,
+  thumbnail text not null default '',
+  created_at bigint not null
+);
+
+create index if not exists activity_logs_created_at_idx
+  on public.activity_logs (created_at desc);
+
+-- 6. Enable Row Level Security & Policies
 alter table public.channel_profile enable row level security;
 alter table public.collections enable row level security;
 alter table public.fashion_items enable row level security;
+alter table public.admin_users enable row level security;
+alter table public.activity_logs enable row level security;
 
 drop policy if exists "Allow public access channel_profile" on public.channel_profile;
 create policy "Allow public access channel_profile"
@@ -71,7 +107,23 @@ create policy "Allow public access fashion_items"
   using (true)
   with check (true);
 
--- 5. Atomic Like & Follow RPC Functions
+drop policy if exists "Allow public access admin_users" on public.admin_users;
+create policy "Allow public access admin_users"
+  on public.admin_users
+  for all
+  to anon, authenticated
+  using (true)
+  with check (true);
+
+drop policy if exists "Allow public access activity_logs" on public.activity_logs;
+create policy "Allow public access activity_logs"
+  on public.activity_logs
+  for all
+  to anon, authenticated
+  using (true)
+  with check (true);
+
+-- 7. Atomic Like & Follow RPC Functions
 create or replace function public.toggle_item_like(p_item_id text, p_delta integer)
 returns integer
 language plpgsql
@@ -108,7 +160,7 @@ $$;
 grant execute on function public.toggle_item_like(text, integer) to anon, authenticated;
 grant execute on function public.toggle_channel_follow(integer) to anon, authenticated;
 
--- 6. Public Storage Bucket for Fashion Photos (1 GB free ~ 3,000 - 5,000 photos)
+-- 8. Public Storage Bucket for Fashion Photos (1 GB free ~ 3,000 - 5,000 photos)
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values (
   'fashion-media',

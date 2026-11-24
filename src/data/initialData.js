@@ -13,7 +13,32 @@ export const DEFAULT_CHANNEL = {
   banner: '/images/banner.jpg',
   whatsapp: '',
   adminPin: '1234',
+  superAdminPin: '9999',
 };
+
+export const DEFAULT_ADMIN_PERMISSIONS = {
+  canUpload: true,
+  canEdit: true,
+  canDelete: false,
+  canManageCollections: true,
+};
+
+export const DEFAULT_ADMINS = [
+  {
+    id: 'admin-default',
+    name: 'Main Admin',
+    roleLabel: 'Store Admin',
+    pin: '1234',
+    active: true,
+    permissions: {
+      canUpload: true,
+      canEdit: true,
+      canDelete: true,
+      canManageCollections: true,
+    },
+    createdAt: Date.now(),
+  },
+];
 
 export const DEFAULT_COLLECTIONS = [
   {

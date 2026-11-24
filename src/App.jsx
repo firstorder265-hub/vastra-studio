@@ -1,17 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  DEFAULT_ADMINS,
   DEFAULT_CHANNEL,
   DEFAULT_COLLECTIONS,
   DEFAULT_ITEMS,
 } from './data/initialData';
 import { dbClear, dbGet, dbSet } from './db';
 import {
+  clearCloudLogs,
+  deleteCloudAdmin,
   deleteCloudCollection,
   deleteCloudItem,
   fetchCloudState,
   getVisitorLikedIds,
   insertCloudCollection,
   insertCloudItems,
+  insertCloudLog,
   isCloudEnabled,
   replaceAllCloudData,
   saveCloudChannel,
@@ -23,43 +27,69 @@ import {
   updateCloudCollection,
   updateCloudItem,
   uploadImageToCloud,
+  upsertCloudAdmin,
 } from './cloud';
 import ChannelHeader from './components/ChannelHeader';
 import FilterBar from './components/FilterBar';
 import PhotoGrid from './components/PhotoGrid';
 import PhotoLightbox from './components/PhotoLightbox';
 import AdminPage from './components/AdminPage';
+import SuperAdminPage from './components/SuperAdminPage';
 
 const SYNC_CHANNEL_NAME = 'vastra_fashion_channel_sync';
-const ADMIN_SESSION_KEY = 'vastra_admin_unlocked';
+const ADMIN_SESSION_ID_KEY = 'vastra_admin_session_id';
+const SUPERADMIN_SESSION_KEY = 'vastra_superadmin_unlocked';
 
-function isAdminLocation() {
+function getActiveRoute() {
   const path = window.location.pathname.replace(/\/+$/, '').toLowerCase();
   const hash = window.location.hash.replace(/^#\/?/, '').toLowerCase();
-  return (
+  if (
+    path === '/superadmin' ||
+    path.startsWith('/superadmin/') ||
+    path === '/super-admin' ||
+    hash === 'superadmin' ||
+    hash.startsWith('superadmin/') ||
+    hash === 'super-admin'
+  ) {
+    return 'superadmin';
+  }
+  if (
     path === '/admin' ||
     path.startsWith('/admin/') ||
     hash === 'admin' ||
     hash.startsWith('admin/')
-  );
+  ) {
+    return 'admin';
+  }
+  return 'public';
 }
 
 export default function App() {
-  const [isAdminRoute, setIsAdminRoute] = useState(isAdminLocation);
+  const [route, setRoute] = useState(getActiveRoute);
   const [ready, setReady] = useState(false);
   const [cloudActive, setCloudActive] = useState(isCloudEnabled);
+
   const [channel, setChannel] = useState(DEFAULT_CHANNEL);
   const [collections, setCollections] = useState(DEFAULT_COLLECTIONS);
   const [items, setItems] = useState(DEFAULT_ITEMS);
+  const [admins, setAdmins] = useState(DEFAULT_ADMINS);
+  const [activityLogs, setActivityLogs] = useState([]);
 
   const [activeCategory, setActiveCategory] = useState('all');
   const [activeCollection, setActiveCollection] = useState('all');
   const [activeSize, setActiveSize] = useState('all');
-
   const [selectedPhotoId, setSelectedPhotoId] = useState(null);
-  const [adminUnlocked, setAdminUnlocked] = useState(() => {
+
+  const [activeAdminId, setActiveAdminId] = useState(() => {
     try {
-      return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1';
+      return sessionStorage.getItem(ADMIN_SESSION_ID_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [superAdminUnlocked, setSuperAdminUnlocked] = useState(() => {
+    try {
+      return sessionStorage.getItem(SUPERADMIN_SESSION_KEY) === '1';
     } catch {
       return false;
     }
@@ -72,6 +102,8 @@ export default function App() {
     channel: false,
     collections: false,
     items: false,
+    admins: false,
+    logs: false,
   });
 
   const showToast = useCallback((msg) => {
@@ -83,7 +115,7 @@ export default function App() {
 
   // Listen to browser navigation (back/forward or hash changes)
   useEffect(() => {
-    const syncRoute = () => setIsAdminRoute(isAdminLocation());
+    const syncRoute = () => setRoute(getActiveRoute());
     window.addEventListener('popstate', syncRoute);
     window.addEventListener('hashchange', syncRoute);
     return () => {
@@ -94,29 +126,52 @@ export default function App() {
 
   // Update browser tab title according to active page
   useEffect(() => {
-    document.title = isAdminRoute
-      ? `Admin Studio — ${channel.name}`
-      : `${channel.name} — Ladies & Boys Fashion Channel`;
-  }, [isAdminRoute, channel.name]);
+    if (route === 'superadmin') {
+      document.title = `Super Admin — ${channel.name}`;
+    } else if (route === 'admin') {
+      document.title = `Admin Studio — ${channel.name}`;
+    } else {
+      document.title = `${channel.name} — Ladies & Boys Fashion Channel`;
+    }
+  }, [route, channel.name]);
 
   const hydrateFromLocal = useCallback(async (fromSync = false) => {
-    const [savedChannel, savedCols, savedItems] = await Promise.all([
-      dbGet('channel'),
-      dbGet('collections'),
-      dbGet('items'),
-    ]);
+    const [savedChannel, savedCols, savedItems, savedAdmins, savedLogs] =
+      await Promise.all([
+        dbGet('channel'),
+        dbGet('collections'),
+        dbGet('items'),
+        dbGet('admins'),
+        dbGet('activity_logs'),
+      ]);
 
     if (fromSync) {
       skipPersistRef.current = {
         channel: true,
         collections: true,
         items: true,
+        admins: true,
+        logs: true,
       };
     }
 
-    setChannel(savedChannel ?? DEFAULT_CHANNEL);
+    const mergedChannel = savedChannel
+      ? { ...DEFAULT_CHANNEL, ...savedChannel }
+      : DEFAULT_CHANNEL;
+    setChannel(mergedChannel);
     setCollections(Array.isArray(savedCols) ? savedCols : DEFAULT_COLLECTIONS);
     setItems(Array.isArray(savedItems) ? savedItems : DEFAULT_ITEMS);
+    setAdmins(
+      Array.isArray(savedAdmins)
+        ? savedAdmins
+        : [
+            {
+              ...DEFAULT_ADMINS[0],
+              pin: mergedChannel.adminPin || '1234',
+            },
+          ]
+    );
+    setActivityLogs(Array.isArray(savedLogs) ? savedLogs : []);
   }, []);
 
   const hydrateFromCloud = useCallback(async () => {
@@ -126,15 +181,44 @@ export default function App() {
         channel: DEFAULT_CHANNEL,
         collections: DEFAULT_COLLECTIONS,
         items: DEFAULT_ITEMS,
+        admins: DEFAULT_ADMINS,
       });
       setChannel(DEFAULT_CHANNEL);
       setCollections(DEFAULT_COLLECTIONS);
       setItems(DEFAULT_ITEMS);
+      setAdmins(DEFAULT_ADMINS);
+      setActivityLogs([]);
       return;
     }
+
     setChannel(cloud.channel);
     setCollections(cloud.collections);
     setItems(cloud.items);
+
+    if (Array.isArray(cloud.admins)) {
+      if (cloud.admins.length === 0) {
+        const seededAdmin = {
+          ...DEFAULT_ADMINS[0],
+          pin: cloud.channel.adminPin || '1234',
+        };
+        setAdmins([seededAdmin]);
+        upsertCloudAdmin(seededAdmin).catch(() => {});
+      } else {
+        setAdmins(cloud.admins);
+      }
+    } else {
+      // admin_users table not migrated yet — fallback gracefully using channel.adminPin
+      setAdmins([
+        {
+          ...DEFAULT_ADMINS[0],
+          pin: cloud.channel.adminPin || '1234',
+        },
+      ]);
+    }
+
+    if (Array.isArray(cloud.logs)) {
+      setActivityLogs(cloud.logs);
+    }
   }, []);
 
   const hydrate = useCallback(
@@ -168,7 +252,7 @@ export default function App() {
     };
   }, [hydrate]);
 
-  // Cross-tab live synchronization between /admin and /
+  // Cross-tab live synchronization
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return undefined;
     const bc = new BroadcastChannel(SYNC_CHANNEL_NAME);
@@ -224,7 +308,53 @@ export default function App() {
     dbSet('items', items).then(notifyOtherTabs);
   }, [items, ready, cloudActive, notifyOtherTabs]);
 
-  // Counts
+  useEffect(() => {
+    if (!ready || cloudActive) return;
+    if (skipPersistRef.current.admins) {
+      skipPersistRef.current.admins = false;
+      return;
+    }
+    dbSet('admins', admins).then(notifyOtherTabs);
+  }, [admins, ready, cloudActive, notifyOtherTabs]);
+
+  useEffect(() => {
+    if (!ready || cloudActive) return;
+    if (skipPersistRef.current.logs) {
+      skipPersistRef.current.logs = false;
+      return;
+    }
+    dbSet('activity_logs', activityLogs).then(notifyOtherTabs);
+  }, [activityLogs, ready, cloudActive, notifyOtherTabs]);
+
+  // Activity Log Recorder
+  const recordActivity = useCallback(
+    ({ actor, action, details, thumbnail = '' }) => {
+      const entry = {
+        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        actorName: actor?.name || 'Admin',
+        actorRole: actor?.role || 'admin',
+        action,
+        details,
+        thumbnail,
+        createdAt: Date.now(),
+      };
+      setActivityLogs((prev) => [entry, ...prev].slice(0, 300));
+      if (cloudActive) {
+        insertCloudLog(entry);
+      }
+    },
+    [cloudActive]
+  );
+
+  // Resolve active staff admin dynamically (immediately revokes if blocked/deleted)
+  const activeAdmin = useMemo(() => {
+    if (!activeAdminId) return null;
+    const found = admins.find((a) => a.id === activeAdminId);
+    if (!found || !found.active) return null;
+    return found;
+  }, [activeAdminId, admins]);
+
+  // Counts & filters
   const counts = useMemo(
     () => ({
       all: items.length,
@@ -245,7 +375,6 @@ export default function App() {
     return Array.from(set);
   }, [items]);
 
-  // Filtered photo gallery
   const filteredItems = useMemo(() => {
     return items
       .filter((it) => {
@@ -368,33 +497,63 @@ export default function App() {
     setActiveSize('all');
   };
 
-  // Admin auth & navigation handlers
-  const handleUnlockAdmin = () => {
+  // Auth & Navigation
+  const handleAdminLoginSuccess = (adminObj) => {
     try {
-      sessionStorage.setItem(ADMIN_SESSION_KEY, '1');
+      sessionStorage.setItem(ADMIN_SESSION_ID_KEY, adminObj.id);
     } catch {
       // ignore
     }
-    setAdminUnlocked(true);
+    setActiveAdminId(adminObj.id);
+    recordActivity({
+      actor: { name: adminObj.name, role: 'admin' },
+      action: 'login',
+      details: `${adminObj.name} (${adminObj.roleLabel || 'Staff Admin'}) ne Admin Studio me login kiya`,
+    });
+    showToast(`Welcome, ${adminObj.name}!`);
   };
 
   const handleLockAdmin = () => {
     try {
-      sessionStorage.removeItem(ADMIN_SESSION_KEY);
+      sessionStorage.removeItem(ADMIN_SESSION_ID_KEY);
     } catch {
       // ignore
     }
-    setAdminUnlocked(false);
-    showToast('Admin Panel lock ho gaya');
+    setActiveAdminId('');
+    showToast('Admin logout ho gaya');
+  };
+
+  const handleUnlockSuperAdmin = () => {
+    try {
+      sessionStorage.setItem(SUPERADMIN_SESSION_KEY, '1');
+    } catch {
+      // ignore
+    }
+    setSuperAdminUnlocked(true);
+    recordActivity({
+      actor: { name: 'Super Admin', role: 'superadmin' },
+      action: 'login',
+      details: 'Super Admin ne Owner Command Center unlock kiya',
+    });
+  };
+
+  const handleLockSuperAdmin = () => {
+    try {
+      sessionStorage.removeItem(SUPERADMIN_SESSION_KEY);
+    } catch {
+      // ignore
+    }
+    setSuperAdminUnlocked(false);
+    showToast('Super Admin lock ho gaya');
   };
 
   const handleGoHome = () => {
     window.history.pushState({}, '', '/');
-    setIsAdminRoute(false);
+    setRoute('public');
   };
 
-  // Admin data handlers (Cloud-aware)
-  const handleAddItems = async (newItems) => {
+  // Shared Media Handlers (used by both Admin & Super Admin)
+  const handleAddItems = async (newItems, actor) => {
     let finalItems = newItems;
     if (cloudActive) {
       finalItems = await Promise.all(
@@ -409,28 +568,38 @@ export default function App() {
     setItems((prev) => [...finalItems, ...prev]);
 
     const firstItem = finalItems[0];
-    if (firstItem?.collectionId) {
-      const targetCol = collections.find((c) => c.id === firstItem.collectionId);
-      if (targetCol && !targetCol.cover) {
-        setCollections((prev) =>
-          prev.map((c) =>
-            c.id === firstItem.collectionId
-              ? { ...c, cover: firstItem.image }
-              : c
-          )
-        );
-        if (cloudActive) {
-          await updateCloudCollection(firstItem.collectionId, {
-            cover: firstItem.image,
-          });
-        }
+    const colObj = collections.find((c) => c.id === firstItem?.collectionId);
+    if (firstItem?.collectionId && colObj && !colObj.cover) {
+      setCollections((prev) =>
+        prev.map((c) =>
+          c.id === firstItem.collectionId
+            ? { ...c, cover: firstItem.image }
+            : c
+        )
+      );
+      if (cloudActive) {
+        await updateCloudCollection(firstItem.collectionId, {
+          cover: firstItem.image,
+        });
       }
     }
+
+    recordActivity({
+      actor,
+      action: 'upload',
+      details: `${finalItems.length} ${
+        firstItem?.category === 'boys' ? 'Boys' : 'Ladies'
+      } photo${finalItems.length > 1 ? 's' : ''} upload ki (${
+        colObj ? colObj.name : 'General'
+      })`,
+      thumbnail: firstItem?.image || '',
+    });
 
     if (cloudActive) notifyOtherTabs();
   };
 
-  const handleUpdateItem = async (id, patch) => {
+  const handleUpdateItem = async (id, patch, actor) => {
+    const existing = items.find((it) => it.id === id);
     setItems((prev) =>
       prev.map((it) => (it.id === id ? { ...it, ...patch } : it))
     );
@@ -440,12 +609,25 @@ export default function App() {
         notifyOtherTabs();
       } catch {
         showToast('Cloud update karne me error aaya');
+        return;
       }
     }
+    const colObj = collections.find(
+      (c) => c.id === (patch.collectionId || existing?.collectionId)
+    );
+    recordActivity({
+      actor,
+      action: 'edit',
+      details: `Photo details edit ki (${
+        patch.category === 'boys' ? 'Boys' : 'Ladies'
+      } • ${colObj ? colObj.name : 'General'})`,
+      thumbnail: existing?.image || '',
+    });
   };
 
-  const handleDeleteItem = async (id) => {
+  const handleDeleteItem = async (id, actor) => {
     const existing = items.find((it) => it.id === id);
+    const colObj = collections.find((c) => c.id === existing?.collectionId);
     setItems((prev) => prev.filter((it) => it.id !== id));
     if (selectedPhotoId === id) setSelectedPhotoId(null);
 
@@ -458,10 +640,19 @@ export default function App() {
         return;
       }
     }
+
+    recordActivity({
+      actor,
+      action: 'delete',
+      details: `${existing?.category === 'boys' ? 'Boys' : 'Ladies'} photo delete ki (${
+        colObj ? colObj.name : 'General'
+      })`,
+      thumbnail: existing?.image?.startsWith('http') ? '' : '',
+    });
     showToast('Photo delete ho gayi');
   };
 
-  const handleAddCollection = async ({ name, category, cover }) => {
+  const handleAddCollection = async ({ name, category, cover }, actor) => {
     let finalCover = cover || '';
     if (cloudActive && finalCover.startsWith('data:')) {
       finalCover = await uploadImageToCloud(finalCover, 'covers');
@@ -480,11 +671,17 @@ export default function App() {
     }
 
     setCollections((prev) => [...prev, created]);
+    recordActivity({
+      actor,
+      action: 'collection_add',
+      details: `Naya collection "${name}" (${(category || 'both').toUpperCase()}) banaya`,
+      thumbnail: finalCover,
+    });
     showToast(`"${name}" collection add ho gaya!`);
     return created;
   };
 
-  const handleDeleteCollection = async (id) => {
+  const handleDeleteCollection = async (id, actor) => {
     const existing = collections.find((c) => c.id === id);
     setCollections((prev) => prev.filter((c) => c.id !== id));
     if (activeCollection === id) setActiveCollection('all');
@@ -498,10 +695,104 @@ export default function App() {
         return;
       }
     }
+    recordActivity({
+      actor,
+      action: 'collection_delete',
+      details: `Collection "${existing?.name || id}" delete kiya`,
+    });
     showToast('Collection delete ho gaya');
   };
 
-  const handleUpdateChannel = async (nextChannel) => {
+  // Super Admin Exclusive Handlers
+  const handleAddAdmin = async ({ name, roleLabel, pin, permissions }) => {
+    const created = {
+      id: `admin-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      name,
+      roleLabel: roleLabel || 'Staff Admin',
+      pin,
+      active: true,
+      permissions,
+      createdAt: Date.now(),
+    };
+    if (cloudActive) {
+      await upsertCloudAdmin(created);
+      notifyOtherTabs();
+    }
+    setAdmins((prev) => [...prev, created]);
+    recordActivity({
+      actor: { name: 'Super Admin', role: 'superadmin' },
+      action: 'admin_change',
+      details: `Naya Staff Admin "${name}" (${created.roleLabel}) add kiya`,
+    });
+    showToast(`Staff Admin "${name}" add ho gaya!`);
+  };
+
+  const handleUpdateAdmin = async (id, patch) => {
+    const existing = admins.find((a) => a.id === id);
+    if (!existing) return;
+    const updated = { ...existing, ...patch };
+    if (cloudActive) {
+      await upsertCloudAdmin(updated);
+      notifyOtherTabs();
+    }
+    setAdmins((prev) => prev.map((a) => (a.id === id ? updated : a)));
+
+    let detailText = `Staff Admin "${updated.name}" ki details/permissions update ki`;
+    if (patch.active === false) {
+      detailText = `Staff Admin "${updated.name}" ko BLOCK kiya`;
+    } else if (patch.active === true && existing.active === false) {
+      detailText = `Staff Admin "${updated.name}" ko UNBLOCK kiya`;
+    }
+
+    recordActivity({
+      actor: { name: 'Super Admin', role: 'superadmin' },
+      action: 'admin_change',
+      details: detailText,
+    });
+    showToast(
+      patch.active === false
+        ? `${updated.name} block ho gaya`
+        : patch.active === true && existing.active === false
+        ? `${updated.name} unblock ho gaya`
+        : `${updated.name} update ho gaya!`
+    );
+  };
+
+  const handleDeleteAdmin = async (id) => {
+    const existing = admins.find((a) => a.id === id);
+    if (!existing) return;
+    if (cloudActive) {
+      await deleteCloudAdmin(id);
+      notifyOtherTabs();
+    }
+    setAdmins((prev) => prev.filter((a) => a.id !== id));
+    recordActivity({
+      actor: { name: 'Super Admin', role: 'superadmin' },
+      action: 'admin_change',
+      details: `Staff Admin "${existing.name}" ko delete kiya`,
+    });
+    showToast(`"${existing.name}" delete ho gaya`);
+  };
+
+  const handleClearLogs = async () => {
+    if (cloudActive) {
+      try {
+        await clearCloudLogs();
+        notifyOtherTabs();
+      } catch {
+        showToast('Cloud logs clear karne me error aaya');
+        return;
+      }
+    }
+    setActivityLogs([]);
+    showToast('Activity logs clear ho gaye');
+  };
+
+  const handleUpdateChannel = async (
+    nextChannel,
+    actor = { name: 'Super Admin', role: 'superadmin' },
+    logDetails = 'Channel settings update ki'
+  ) => {
     let finalChannel = { ...nextChannel };
     if (cloudActive) {
       if (finalChannel.avatar?.startsWith('data:')) {
@@ -520,11 +811,23 @@ export default function App() {
       notifyOtherTabs();
     }
     setChannel(finalChannel);
+    recordActivity({
+      actor,
+      action: 'settings',
+      details: logDetails,
+    });
   };
 
   const handleExportBackup = () => {
     const payload = JSON.stringify(
-      { channel, collections, items, exportedAt: new Date().toISOString() },
+      {
+        channel,
+        collections,
+        items,
+        admins,
+        activityLogs,
+        exportedAt: new Date().toISOString(),
+      },
       null,
       2
     );
@@ -543,11 +846,14 @@ export default function App() {
     reader.onload = async (e) => {
       try {
         const parsed = JSON.parse(e.target.result);
-        const nextChannel = parsed.channel || channel;
+        const nextChannel = parsed.channel
+          ? { ...DEFAULT_CHANNEL, ...parsed.channel }
+          : channel;
         const nextCollections = Array.isArray(parsed.collections)
           ? parsed.collections
           : collections;
         const nextItems = Array.isArray(parsed.items) ? parsed.items : items;
+        const nextAdmins = Array.isArray(parsed.admins) ? parsed.admins : admins;
 
         if (cloudActive) {
           showToast('Backup cloud par restore ho raha hai...');
@@ -555,6 +861,7 @@ export default function App() {
             channel: nextChannel,
             collections: nextCollections,
             items: nextItems,
+            admins: nextAdmins,
           });
           notifyOtherTabs();
         }
@@ -562,6 +869,12 @@ export default function App() {
         setChannel(nextChannel);
         setCollections(nextCollections);
         setItems(nextItems);
+        setAdmins(nextAdmins);
+        recordActivity({
+          actor: { name: 'Super Admin', role: 'superadmin' },
+          action: 'settings',
+          details: 'Backup JSON restore kiya',
+        });
         showToast('Backup restore ho gaya!');
       } catch {
         showToast('Invalid backup JSON file ya restore error');
@@ -577,6 +890,7 @@ export default function App() {
           channel: DEFAULT_CHANNEL,
           collections: DEFAULT_COLLECTIONS,
           items: DEFAULT_ITEMS,
+          admins: DEFAULT_ADMINS,
         });
       } catch {
         showToast('Cloud reset karne me error aaya');
@@ -588,24 +902,32 @@ export default function App() {
     setChannel(DEFAULT_CHANNEL);
     setCollections(DEFAULT_COLLECTIONS);
     setItems(DEFAULT_ITEMS);
+    setAdmins(DEFAULT_ADMINS);
     handleResetFilters();
+    recordActivity({
+      actor: { name: 'Super Admin', role: 'superadmin' },
+      action: 'settings',
+      details: 'Demo data reset kiya',
+    });
     notifyOtherTabs();
     showToast('Demo data reset ho gaya!');
   };
 
-  // Dedicated Admin Portal Route (/admin)
-  if (isAdminRoute) {
+  // ROUTE 1: Dedicated Super Admin Command Center (/superadmin or /#/superadmin)
+  if (route === 'superadmin') {
     return (
       <>
-        <AdminPage
-          isUnlocked={adminUnlocked}
+        <SuperAdminPage
+          isUnlocked={superAdminUnlocked}
           isCloudActive={cloudActive}
-          onUnlock={handleUnlockAdmin}
-          onLock={handleLockAdmin}
+          onUnlock={handleUnlockSuperAdmin}
+          onLock={handleLockSuperAdmin}
           onGoHome={handleGoHome}
           channel={channel}
           collections={collections}
           items={items}
+          admins={admins}
+          activityLogs={activityLogs}
           counts={counts}
           totalLikes={totalLikes}
           onAddItems={handleAddItems}
@@ -614,6 +936,10 @@ export default function App() {
           onAddCollection={handleAddCollection}
           onDeleteCollection={handleDeleteCollection}
           onUpdateChannel={handleUpdateChannel}
+          onAddAdmin={handleAddAdmin}
+          onUpdateAdmin={handleUpdateAdmin}
+          onDeleteAdmin={handleDeleteAdmin}
+          onClearLogs={handleClearLogs}
           onExportBackup={handleExportBackup}
           onImportBackup={handleImportBackup}
           onResetDemo={handleResetDemo}
@@ -624,7 +950,35 @@ export default function App() {
     );
   }
 
-  // Clean Public Customer Website Route (/)
+  // ROUTE 2: Dedicated Staff Admin Portal (/admin or /#/admin)
+  if (route === 'admin') {
+    return (
+      <>
+        <AdminPage
+          activeAdmin={activeAdmin}
+          isCloudActive={cloudActive}
+          admins={admins}
+          channel={channel}
+          collections={collections}
+          items={items}
+          counts={counts}
+          totalLikes={totalLikes}
+          onLoginSuccess={handleAdminLoginSuccess}
+          onLock={handleLockAdmin}
+          onGoHome={handleGoHome}
+          onAddItems={handleAddItems}
+          onUpdateItem={handleUpdateItem}
+          onDeleteItem={handleDeleteItem}
+          onAddCollection={handleAddCollection}
+          onDeleteCollection={handleDeleteCollection}
+          showToast={showToast}
+        />
+        {toast && <div className="toast">{toast}</div>}
+      </>
+    );
+  }
+
+  // ROUTE 3: Clean Public Customer Website (/)
   return (
     <>
       <div className="channel-shell">
